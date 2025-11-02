@@ -1,5 +1,5 @@
 # Azurlane Spine2d To Blender
-本项目为开发stellaris模组时写的插件工具  
+本项目为开发stellaris模组时写的插件工具 ，仅支持spine2d 3.8的文件
 # 使用方法
 1.通过unity反编译工具AssetStudio对游戏解包出的spine文件进行还原,通常会得到.png/.skel.asset/.atlas.asset文件,去掉.asset后缀  
 2.将以上三个文件放入一个文件夹内,在spine软件内进行纹理解包,解包文件选择图集文件.atlas,解压到该文件夹  
