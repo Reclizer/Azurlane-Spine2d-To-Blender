@@ -94,19 +94,49 @@ def get_uv_loc(data):
 
     offset_x = offset_x
     offset_y = origy - height - offset_y
-
+    final_x0, final_y0, final_x, final_y=0,0,0,0
     if rotate == "true":
         final_x0 = ltx - offset_y
         final_y0 = lty - (origx - width) + offset_x
         final_x = final_x0 + origy
         final_y = final_y0 + origx
-    else:
+    elif rotate == "false":
+        final_x0 = ltx - offset_x
+        final_y0 = lty - offset_y
+        final_x = final_x0 + origx
+        final_y = final_y0 + origy
+    elif rotate == "270":
+        final_x0 = ltx - offset_y
+        final_y0 = lty - (origx - width) + offset_x
+        final_x = final_x0 + origy
+        final_y = final_y0 + origx
+    elif rotate == "180":
         final_x0 = ltx - offset_x
         final_y0 = lty - offset_y
         final_x = final_x0 + origx
         final_y = final_y0 + origy
 
     return (final_x0, final_y0, final_x, final_y)
+
+
+def rotate_points_2d(points, angle_deg, center):
+    """
+    points: 点组list，如 [(x1,y1),(x2,y2),...]
+    angle_deg: 旋转角度（逆时针为正）
+    center: 旋转中心 (cx, cy)
+    """
+    cx, cy = center
+    angle_rad = math.radians(angle_deg)
+
+    rotated = []
+    for x, y in points:
+        dx = x - cx
+        dy = y - cy
+        x_new = dx * math.cos(angle_rad) - dy * math.sin(angle_rad) + cx
+        y_new = dx * math.sin(angle_rad) + dy * math.cos(angle_rad) + cy
+        rotated.append((round(x_new, 4), round(y_new, 4)))
+
+    return rotated
 
 def create_uv(mesh_name, uvs, atlas):
     width = atlas.get("size")[0]
@@ -131,11 +161,23 @@ def create_uv(mesh_name, uvs, atlas):
             u = u0 + (u1 - u0) * (uvs[i * 2 + 1])
             v = 1 - v1 + (v1 - v0) * (uvs[i * 2])
             uv_list.append((u, v))
-    else:
+    elif atlas[mesh_name].get("rotate") == "false":
         # u0,u1,v0,v1=x0/width,x1/width,y0/height,y1/height
         for i in range(int(len(uvs) / 2)):
             u = u0 + (u1 - u0) * (uvs[i * 2])
             v = 1 - v1 + (v1 - v0) * (1 - uvs[i * 2 + 1])
+            uv_list.append((u, v))
+    elif atlas[mesh_name].get("rotate") == "180":
+        # u0,u1,v0,v1=x0/width,x1/width,y0/height,y1/height
+        for i in range(int(len(uvs) / 2)):
+            u = u0 + (u1 - u0) * (1-uvs[i * 2])
+            v = 1 - v1 + (v1 - v0) * (uvs[i * 2 + 1])
+            uv_list.append((u, v))
+    elif atlas[mesh_name].get("rotate") == "270":
+        # u0,u1,v0,v1=x0/width,x1/width,y0/height,y1/height
+        for i in range(int(len(uvs) / 2)):
+            u = u0 + (u1 - u0) * (1 - uvs[i * 2+1])
+            v = 1 - v1 + (v1 - v0) * (1-uvs[i * 2])
             uv_list.append((u, v))
     # =============================================================================
 
@@ -245,6 +287,7 @@ def create_bones(rig_name, bones_info, scale):
 
     bpy.ops.pose.armature_apply(selected=False)
     bpy.ops.object.mode_set(mode='OBJECT')
+    
     return new_rig
 
 
@@ -724,10 +767,8 @@ def create_animations(animations_data, rig, scale):
                 rot -= key_r
 
                 angle_radians = math.radians(key_r)
-                bpy.ops.transform.rotate(
-                    value=angle_radians,
-                    orient_axis='Y')
-
+                #bpy.ops.transform.rotate(value=angle_radians,orient_axis='Y')
+                bpy.ops.transform.rotate(value=angle_radians, orient_axis='Y', orient_type='GLOBAL')
                 bpy.ops.anim.keyframe_insert_by_name(type="Rotation")
 
         if translate:
@@ -743,8 +784,12 @@ def create_animations(animations_data, rig, scale):
                 loc -= key_y
                 key_x = key.get("x", 0) * scale + loc_x
                 loc_x -= key_x
-
-                bpy.ops.transform.translate(value=(key_x, 0, key_y), orient_axis_ortho='Z')
+                bpy.ops.transform.translate(
+                    value=(key_x, 0, key_y),
+                    orient_type='GLOBAL',
+                    constraint_axis=(False, True, False)
+                )
+                #bpy.ops.transform.translate(value=(key_x, 0, key_y), orient_axis_ortho='Z')
                 bpy.ops.anim.keyframe_insert_by_name(type="Location")
     bpy.context.scene.frame_end = frame_end
     # 遍历对象的所有动作
@@ -755,7 +800,25 @@ def create_animations(animations_data, rig, scale):
             for keyframe_point in fcurve.keyframe_points:
                 keyframe_point.interpolation = 'LINEAR'
 
+def bing_ik(rig,ik_info):
+    for ik_data in ik_info:
+        # 1. 获取末端骨骼（IK 应该加在链的最后一节骨骼上）
+        end_bone_name = ik_data["bones"][-1]
+        end_bone = rig.pose.bones.get(end_bone_name)
 
+        # 2. 获取目标骨骼（target）
+        target_bone_name = ik_data["target"]
+
+        # 3. 创建 IK 约束
+        constraint = end_bone.constraints.new(type='IK')
+        constraint.name = f"IK_{ik_data['name']}"
+        constraint.target = rig           # 目标为自身骨架
+        constraint.subtarget = target_bone_name
+        constraint.chain_count = len(ik_data["bones"])  # 链长为骨骼数量
+
+        if ik_data.get("bendPositive"):
+            # 4. 控制弯曲方向（根据 bendPositive 决定 pole_angle 方向）
+            constraint.pole_angle = 0 if ik_data["bendPositive"]!="false" else math.pi  # 反向弯曲可调 π 弧度
 
 
 
@@ -824,17 +887,21 @@ def import_jsonfile(json_path,add=False,reload=False):
         # materials=creat_materials(atlas["image"].split(".")[0]+"_mat",image_path)
         # 创建骨骼
         bones_info = json_data.get("bones")
+        ik_info = json_data.get("ik")
+        
         rig_name = name.split(".")[0] + "_rig"
         new_rig = create_bones(rig_name, bones_info, scale)
+        if ik_info:
+            bing_ik(new_rig,ik_info)
         bone_matrix = _get_bone_matrix_dict(new_rig)
 
         create_mesh_all(json_data, atlas, new_rig, image_path, bone_matrix, scale, add)
-
+        
         animations = json_data.get("animations")
 
         if not add:
             create_animations(animations, new_rig, scale)
-
+        
 
 
 
