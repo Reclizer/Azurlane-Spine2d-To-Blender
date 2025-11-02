@@ -245,29 +245,33 @@ class FixWeight(bpy.types.Operator):
 
     def execute(self, context):
         choose_num=0
-        selected_objects = bpy.context.selected_objects
+        selected_objects = context.selected_objects
         for obj in selected_objects:
-            if obj.type == 'MESH':
+            # 获取当前选中的对象
+            # 确保对象是网格类型并且进入对象模式
+            if obj and obj.type == 'MESH':
                 choose_num+=1
-                #normalize_and_round_vertex_weights(obj)
+                bpy.ops.object.mode_set(mode='OBJECT')
                 mesh = obj.data
-        
-                # 获取所有顶点组
-                vertex_groups = obj.vertex_groups
-                
+
                 # 遍历每个顶点
-                for vertex in mesh.vertices:
-                    total_weight = sum([group.weight for group in vertex.groups])
-                    group_len = len(vertex.groups)
+                for v in mesh.vertices:
+                    total_weight = 0
+                    # 计算当前顶点所有顶点组的总权重
+                    for g in v.groups:
+                        total_weight += g.weight
+
+                    # 如果总权重不为零，则归一化
                     if total_weight > 0:
-                        for group in vertex.groups:
-                            # 归一化权重
-                            normalized_weight = group.weight / total_weight
-                            # 四舍五入保留小数点后2位
-                            rounded_weight = round(normalized_weight, 1)
-                            vertex_groups[group.group].add([vertex.index], rounded_weight, 'REPLACE')
-                            if group_len>1 and rounded_weight==0:
-                                vertex_groups[group.group].remove([vertex.index])
+                        for g in v.groups:
+                            v_group = obj.vertex_groups[g.group]
+                            normalized_weight = g.weight / total_weight
+
+
+                            v_group.add([v.index], normalized_weight, 'REPLACE')
+            else:
+                print("请选择一个网格物体")
+
         self.report({'INFO'}, f"修改了 '{choose_num}' 个物体")
         return {'FINISHED'}
 
@@ -407,5 +411,5 @@ def unregister():
     
     
 
-#if __name__ == "__main__":
-    #register()
+if __name__ == "__main__":
+    register()
