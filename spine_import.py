@@ -1,240 +1,218 @@
 import bpy
-import time
 import json
-from mathutils import Vector, Matrix, Quaternion
 import math
 import os
 import numpy as np
+from mathutils import Vector
+
+# spine 动画时间以秒为单位, 按 30fps 换算成帧号
+FPS = 30
+
 
 def convert_to_latin1_compatible(text):
-    def is_latin1(character):
-        try:
-            character.encode('latin-1')
-            return True
-        except UnicodeEncodeError:
-            return False
-
-    return ''.join([f'u{ord(char):04x}' if not is_latin1(char) else char for char in text])
+    """把 json 里 latin-1 无法表示的字符(如中文)转成 uXXXX 形式, 避免骨骼/顶点组名乱码"""
+    if all(ord(char) < 256 for char in text):
+        return text
+    return ''.join(char if ord(char) < 256 else f'u{ord(char):04x}' for char in text)
 
 
-def get_vertices_list(_vertices, scale=1, _list=[]):
-    _data = []
+def get_vertices_list(vertices, scale=1):
+    """解析加权网格的顶点数据
 
-    for _ in range(_vertices.pop(0)):
-        _data.append(
-            {
-                'bone_idx': _vertices.pop(0),
-                'x': _vertices.pop(0) * scale,
-                'y': _vertices.pop(0) * scale,
-                'weight': _vertices.pop(0),
-            }
-        )
-    _list.append(_data)
-    if len(_vertices) >= 5:
-        return get_vertices_list(_vertices, scale=scale, _list=_list)
-    return _list
+    数据格式: [骨骼数, (骨骼索引, x, y, 权重) * 骨骼数, 骨骼数, ...]
+    返回: 每个顶点一个 list, 内含它受影响的所有骨骼信息
+    """
+    result = []
+    i = 0
+    total = len(vertices)
+    while i < total:
+        bone_count = int(vertices[i])
+        i += 1
+        influences = []
+        for _ in range(bone_count):
+            influences.append({
+                'bone_idx': int(vertices[i]),
+                'x': vertices[i + 1] * scale,
+                'y': vertices[i + 2] * scale,
+                'weight': vertices[i + 3],
+            })
+            i += 4
+        result.append(influences)
+    return result
+
 
 def create_materials(name, image_path):
-    # 创建新的材质
     material = bpy.data.materials.new(name=name)
     material["shader"] = "PdxMeshPortrait"
 
     material.use_nodes = True
     nodes = material.node_tree.nodes
     links = material.node_tree.links
+    nodes.clear()
 
-    # 清空默认节点
-    for node in nodes:
-        nodes.remove(node)
-
-    # 创建材质输出节点
     material_output = nodes.new(type='ShaderNodeOutputMaterial')
     material_output.location = (300, 0)
 
-    # 创建 Principled BSDF 节点
     bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
     bsdf.location = (0, 0)
 
-    # 创建图像纹理节点
     texture_image = nodes.new(type='ShaderNodeTexImage')
     texture_image.image = bpy.data.images.load(image_path)
     texture_image.location = (-300, 0)
 
-    # 将节点连接起来
     links.new(texture_image.outputs['Color'], bsdf.inputs['Base Color'])
     links.new(bsdf.outputs['BSDF'], material_output.inputs['Surface'])
     links.new(texture_image.outputs['Alpha'], bsdf.inputs['Alpha'])
-    #material.blend_method = 'CLIP'
     material.blend_method = 'HASHED'
 
     return material
 
+
 def _get_bone_matrix_dict(arm_obj):
     _matrix_dict = {}
-    for i in arm_obj.pose.bones:
-        _dict = {
-            "matrix_eular": i.matrix.to_euler('XYZ').copy(),
-            "matrix_scale": i.matrix.to_scale().copy(),
-            "matrix_translation": i.matrix.to_translation().copy(),
+    for pbone in arm_obj.pose.bones:
+        _matrix_dict[pbone.name] = {
+            "matrix_eular": pbone.matrix.to_euler('XYZ').copy(),
+            "matrix_scale": pbone.matrix.to_scale().copy(),
+            "matrix_translation": pbone.matrix.to_translation().copy(),
         }
-        _matrix_dict |= {i.name: _dict}
     return _matrix_dict
 
+
 def get_uv_loc(data):
-    rotate = data.get("rotate").strip()
-    xy = data.get("xy").strip()
-    size = data.get("size").strip()
-    orig = data.get("orig").strip()
-    offset = data.get("offset").strip()
+    """由图集条目算出贴图区域在整张图上的像素范围 (x0, y0, x1, y1)"""
+    rotate = data.get("rotate", "false")
+    width, height = (int(v) for v in data["size"].split(","))
+    ltx, lty = (int(v) for v in data["xy"].split(","))
+    origx, origy = (int(v) for v in data["orig"].split(","))
+    offset_x, offset_y = (int(v) for v in data["offset"].split(","))
 
-    width, height = list(map(int, size.split(",")))
-    ltx, lty = list(map(int, xy.split(",")))
-    origx, origy = list(map(int, orig.split(",")))
-    offset_x, offset_y = list(map(int, offset.split(",")))
-
-    offset_x = offset_x
     offset_y = origy - height - offset_y
-    final_x0, final_y0, final_x, final_y=0,0,0,0
-    if rotate == "true":
+
+    if rotate in ("true", "270"):
         final_x0 = ltx - offset_y
         final_y0 = lty - (origx - width) + offset_x
-        final_x = final_x0 + origy
-        final_y = final_y0 + origx
-    elif rotate == "false":
-        final_x0 = ltx - offset_x
-        final_y0 = lty - offset_y
-        final_x = final_x0 + origx
-        final_y = final_y0 + origy
-    elif rotate == "270":
-        final_x0 = ltx - offset_y
-        final_y0 = lty - (origx - width) + offset_x
-        final_x = final_x0 + origy
-        final_y = final_y0 + origx
-    elif rotate == "180":
-        final_x0 = ltx - offset_x
-        final_y0 = lty - offset_y
-        final_x = final_x0 + origx
-        final_y = final_y0 + origy
+        return (final_x0, final_y0, final_x0 + origy, final_y0 + origx)
 
-    return (final_x0, final_y0, final_x, final_y)
+    # false / 180
+    final_x0 = ltx - offset_x
+    final_y0 = lty - offset_y
+    return (final_x0, final_y0, final_x0 + origx, final_y0 + origy)
 
 
-def rotate_points_2d(points, angle_deg, center):
-    """
-    points: 点组list，如 [(x1,y1),(x2,y2),...]
-    angle_deg: 旋转角度（逆时针为正）
-    center: 旋转中心 (cx, cy)
-    """
-    cx, cy = center
-    angle_rad = math.radians(angle_deg)
-
-    rotated = []
-    for x, y in points:
-        dx = x - cx
-        dy = y - cy
-        x_new = dx * math.cos(angle_rad) - dy * math.sin(angle_rad) + cx
-        y_new = dx * math.sin(angle_rad) + dy * math.cos(angle_rad) + cy
-        rotated.append((round(x_new, 4), round(y_new, 4)))
-
-    return rotated
-
-def create_uv(mesh_name, uvs, atlas):
-    width = atlas.get("size")[0]
-    height = atlas.get("size")[1]
-
-    if not atlas.get(mesh_name):
+def create_uv(region_name, uvs, atlas):
+    """把 spine 的 uv 坐标映射到整张图集上, 找不到图集条目时返回 None"""
+    region = atlas.get(region_name)
+    if not region:
         return None
 
-    loc = get_uv_loc(atlas[mesh_name])
-
-    x0, y0, x1, y1 = loc[0], loc[1], loc[2], loc[3]
-
-    # if mesh_name=="hair_B":
-    # print(x0,y0,x1,y1)
+    width, height = atlas["size"]
+    x0, y0, x1, y1 = get_uv_loc(region)
+    u0, u1, v0, v1 = x0 / width, x1 / width, y0 / height, y1 / height
+    rotate = region.get("rotate", "false")
 
     uv_list = []
-    u0, u1, v0, v1 = x0 / width, x1 / width, y0 / height, y1 / height
-    # =============================================================================
-    if atlas[mesh_name].get("rotate") == "true":
-        # u0,u1,v0,v1=x0/width,x1/width,y0/height,y1/height
-        for i in range(int(len(uvs) / 2)):
-            u = u0 + (u1 - u0) * (uvs[i * 2 + 1])
-            v = 1 - v1 + (v1 - v0) * (uvs[i * 2])
-            uv_list.append((u, v))
-    elif atlas[mesh_name].get("rotate") == "false":
-        # u0,u1,v0,v1=x0/width,x1/width,y0/height,y1/height
-        for i in range(int(len(uvs) / 2)):
-            u = u0 + (u1 - u0) * (uvs[i * 2])
-            v = 1 - v1 + (v1 - v0) * (1 - uvs[i * 2 + 1])
-            uv_list.append((u, v))
-    elif atlas[mesh_name].get("rotate") == "180":
-        # u0,u1,v0,v1=x0/width,x1/width,y0/height,y1/height
-        for i in range(int(len(uvs) / 2)):
-            u = u0 + (u1 - u0) * (1-uvs[i * 2])
-            v = 1 - v1 + (v1 - v0) * (uvs[i * 2 + 1])
-            uv_list.append((u, v))
-    elif atlas[mesh_name].get("rotate") == "270":
-        # u0,u1,v0,v1=x0/width,x1/width,y0/height,y1/height
-        for i in range(int(len(uvs) / 2)):
-            u = u0 + (u1 - u0) * (1 - uvs[i * 2+1])
-            v = 1 - v1 + (v1 - v0) * (1-uvs[i * 2])
-            uv_list.append((u, v))
-    # =============================================================================
-
+    for i in range(len(uvs) // 2):
+        su, sv = uvs[i * 2], uvs[i * 2 + 1]
+        if rotate == "true":
+            ut, vt = sv, su
+        elif rotate == "180":
+            ut, vt = 1 - su, sv
+        elif rotate == "270":
+            ut, vt = 1 - sv, 1 - su
+        else:  # false
+            ut, vt = su, 1 - sv
+        uv_list.append((u0 + (u1 - u0) * ut, 1 - v1 + (v1 - v0) * vt))
     return uv_list
 
-def read_atlas(file_path):
-    atlas = {}
-    with open(file_path, 'r', encoding='utf-8') as file:
-        index = -1
-        num = 0
-        list_name = ""
-        list_0 = {}
-        for line in file:
-            index += 1
-            if index == 1:
-                atlas["image"] = line.strip()
-            if index == 2:
-                size = line.split(":")[1].strip().split(",")
-                atlas["size"] = (int(size[0]), int(size[1]))
-            if index == 3:
-                atlas["format"] = line.split(":")[1].strip()
-            if index == 4:
-                atlas["filter"] = line.split(":")[1].strip()
-            if index == 5:
-                atlas["repeat"] = line.split(":")[1].strip()
-            if index > 5:
-                num += 1
-                if num == 1:
-                    list_name = line.strip()
-                if num == 2:
-                    list_0["rotate"] = line.split(":")[1].strip()
-                if num == 3:
-                    list_0["xy"] = line.split(":")[1].strip()
-                if num == 4:
-                    list_0["size"] = line.split(":")[1].strip()
-                if num == 5:
-                    list_0["orig"] = line.split(":")[1].strip()
-                if num == 6:
-                    list_0["offset"] = line.split(":")[1].strip()
-                if num == 7:
-                    list_0["index"] = int(line.split(":")[1].strip())
-                    atlas[list_name] = list_0
-                    list_0 = {}
-                    num = 0
 
+def assign_uvs(mesh, uv_list):
+    """按顶点索引把 uv 写入新建的 uv 层"""
+    uv_layer = mesh.uv_layers.new()
+    flat = [0.0] * (len(mesh.loops) * 2)
+    for i, loop in enumerate(mesh.loops):
+        u, v = uv_list[loop.vertex_index]
+        flat[i * 2] = u
+        flat[i * 2 + 1] = v
+    uv_layer.data.foreach_set("uv", flat)
+
+
+def _finish_atlas_region(name, data, atlas):
+    """补全缺省字段并兼容 spine 4.x 的 bounds/offsets 写法"""
+    if "bounds" in data:  # 4.x: bounds = x, y, w, h
+        x, y, w, h = (v.strip() for v in data["bounds"].split(","))
+        data["xy"] = f"{x}, {y}"
+        data["size"] = f"{w}, {h}"
+    if "offsets" in data:  # 4.x: offsets = ox, oy, ow, oh
+        ox, oy, ow, oh = (v.strip() for v in data["offsets"].split(","))
+        data["offset"] = f"{ox}, {oy}"
+        data["orig"] = f"{ow}, {oh}"
+
+    data.setdefault("offset", "0, 0")
+    data.setdefault("orig", data.get("size", "0, 0"))
+    rotate = data.get("rotate", "false")
+    data["rotate"] = "true" if rotate == "90" else rotate
+    data["index"] = int(data.get("index", -1))
+    atlas[name] = data
+
+
+def read_atlas(file_path):
+    """解析 .atlas 图集文件
+
+    按 "键: 值" 逐行解析而不是按行号定位, 字段缺失或顺序变化也能读;
+    兼容 spine 3.x / 4.x 两种格式。多页图集只取第一页(与旧版行为一致)。
+    """
+    atlas = {}
+    current = None
+    current_name = None
+    prev_blank = True
+
+    with open(file_path, 'r', encoding='utf-8') as file:
+        for raw in file:
+            line = raw.strip()
+            if not line:
+                prev_blank = True
+                continue
+
+            if ":" in line:
+                key, _, value = line.partition(":")
+                key, value = key.strip(), value.strip()
+                if current is None:
+                    # 页头字段 (size / format / filter / repeat ...)
+                    if key == "size":
+                        w, h = value.split(",")
+                        atlas["size"] = (int(w), int(h))
+                    else:
+                        atlas[key] = value
+                else:
+                    current[key] = value
+                prev_blank = False
+                continue
+
+            # 不带冒号的行: 第一次出现是图片名, 之后是区域名
+            if "image" not in atlas:
+                atlas["image"] = line
+            elif prev_blank:
+                # 空行后又出现图片名 => 第二页图集, 暂不支持
+                print(f"[spine2d] 多页图集暂不支持, 忽略后续图集页: {line}")
+                break
+            else:
+                if current_name is not None:
+                    _finish_atlas_region(current_name, current, atlas)
+                current_name = line
+                current = {}
+            prev_blank = False
+
+    if current_name is not None and current:
+        _finish_atlas_region(current_name, current, atlas)
     return atlas
 
 
 def create_bones(rig_name, bones_info, scale):
-    tmp_rig_name = rig_name
-    armt = bpy.data.armatures.new("armature")
-    armt.name = "imported_armature"
+    armt = bpy.data.armatures.new(rig_name)
     armt.display_type = "STICK"
 
-
-    # create the object and link to the scene
-    new_rig = bpy.data.objects.new(tmp_rig_name, armt)
+    new_rig = bpy.data.objects.new(rig_name, armt)
     bpy.context.scene.collection.objects.link(new_rig)
     bpy.context.view_layer.objects.active = new_rig
     new_rig.show_in_front = True
@@ -242,667 +220,500 @@ def create_bones(rig_name, bones_info, scale):
 
     bpy.ops.object.mode_set(mode="EDIT")
     bone_dict = {}
-    bones_info_xy = bones_info.copy()
 
-    for bone in bones_info_xy:
-        bone_name = bone["name"]
+    for bone in bones_info:
         parent_name = bone.get("parent")
         length = bone.get("length", 1) * scale
         transform = bone.get('transform')
+
         new_bone = armt.edit_bones.new(name=bone["name"])
-        new_bone.select = True
         bone_dict[bone["name"]] = new_bone
+
         if parent_name:
-            parent_bone = bone_dict[bone["parent"]]
+            parent_bone = bone_dict[parent_name]
             new_bone.parent = parent_bone
             new_bone.head = parent_bone.head
             new_bone.use_connect = False
         else:
             new_bone.head = Vector((0, 0, 0))
 
-        if length == 1 * scale:
-            # new_bone.tail = new_bone.head + Vector((0, length, 0))
-            new_bone.tail = new_bone.head + Vector((length * 0.01, 0, 0))
+        # 没写长度或长度为 0 时给一个极小尾巴, 避免零长骨骼被 Blender 自动删除
+        if length <= 0 or length == scale:
+            new_bone.tail = new_bone.head + Vector((scale * 0.01, 0, 0))
         else:
             new_bone.tail = new_bone.head + Vector((length, 0, 0))
-        if transform == "noRotationOrReflection":
+
+        if transform in ("noRotationOrReflection", "onlyTranslation"):
             new_bone.use_inherit_rotation = False
 
-
-    # 变换骨骼
+    # 在姿态模式下摆好初始位置和旋转, 再应用为静置姿态
     bpy.ops.object.mode_set(mode='POSE')
     for bone in bones_info:
-        bone_name = bone["name"]
-        rotation = bone.get("rotation", 0)
-        x = bone.get("x", 0) * scale
-        y = bone.get("y", 0) * scale
-        bone_c = new_rig.pose.bones[bone["name"]]
-        bone_c.location = 0, x, y
-        transform = bone.get('transform')
-        #if transform == "noRotationOrReflection":
-            #armt.bones[bone_name].use_inherit_rotation = False
-            #rotation=0
-        bone_c.rotation_mode = 'XYZ'
-        bone_c.rotation_euler[0] = math.radians(rotation)
+        pbone = new_rig.pose.bones[bone["name"]]
+        pbone.location = 0, bone.get("x", 0) * scale, bone.get("y", 0) * scale
+        pbone.rotation_mode = 'XYZ'
+        pbone.rotation_euler[0] = math.radians(bone.get("rotation", 0))
 
     bpy.ops.pose.armature_apply(selected=False)
     bpy.ops.object.mode_set(mode='OBJECT')
-    
+
     return new_rig
 
 
-# 函数：获取或创建顶点组
 def get_or_create_vertex_group(obj, group_name):
-    if group_name in obj.vertex_groups:
-        vertex_group = obj.vertex_groups[group_name]
-    else:
-        vertex_group = obj.vertex_groups.new(name=group_name)
-    return vertex_group
+    return obj.vertex_groups.get(group_name) or obj.vertex_groups.new(name=group_name)
 
 
-def create_mesh(mesh_name, bone_name, point_data, bone_list,  atlas,  bone_matrix, scale):
-    if not point_data.get('type') == 'mesh':
-        width = point_data.get('width', 0) * scale
-        height = point_data.get('height', 0) * scale
+def create_mesh(mesh_name, bone_name, point_data, bone_list, atlas, bone_matrix, scale):
+    attach_type = point_data.get('type')
+    if attach_type not in (None, 'region', 'mesh'):
+        # clipping / boundingbox / path / point 等附件不产生网格
+        print(f"[spine2d] 跳过不支持的附件类型 {attach_type}: {mesh_name}")
+        return None
+
+    # 附件可以指定 path/name 指向图集里的其它区域
+    region_name = point_data.get('path') or point_data.get('name') or mesh_name
+
+    if attach_type != 'mesh':
+        # region 附件: 一个带旋转/缩放的矩形贴片
+        width = point_data.get('width', 0) * scale * point_data.get('scaleX', 1)
+        height = point_data.get('height', 0) * scale * point_data.get('scaleY', 1)
         mesh_rot = point_data.get('rotation', 0)
-        x = point_data.get('x',0) * scale
-        y = point_data.get('y',0) * scale
-        _bone=bone_matrix.get(bone_name)
+        x = point_data.get('x', 0) * scale
+        y = point_data.get('y', 0) * scale
+        _bone = bone_matrix.get(bone_name)
 
-        region_x = x * math.cos(_bone['matrix_eular'][0]) - y * math.sin(_bone['matrix_eular'][0])
-        region_y = x * math.sin(_bone['matrix_eular'][0]) + y * math.cos(_bone['matrix_eular'][0])
-        rotate = _bone['matrix_eular'][0] + math.radians(mesh_rot)
+        euler = _bone['matrix_eular'][0]
+        region_x = x * math.cos(euler) - y * math.sin(euler)
+        region_y = x * math.sin(euler) + y * math.cos(euler)
+        rotate = euler + math.radians(mesh_rot)
+        cr, sr = math.cos(rotate), math.sin(rotate)
+        sx, sz = _bone['matrix_scale'][1], _bone['matrix_scale'][2]
+        tx, tz = _bone['matrix_translation'][0], _bone['matrix_translation'][2]
 
+        corners = [(-width / 2, height / 2), (width / 2, height / 2),
+                   (-width / 2, -height / 2), (width / 2, -height / 2)]
         mesh_vertices = [
-            (
-                (
-                        (-width / 2) * math.cos(rotate) - (height / 2) * math.sin(rotate) + region_x)
-                * _bone['matrix_scale'][1] + _bone['matrix_translation'][0],
-                0,
-                (
-                        (-width / 2) * math.sin(rotate) + (height / 2) * math.cos(rotate) + region_y)
-                * _bone['matrix_scale'][2] + _bone['matrix_translation'][2]
-            ), (
-                (
-                        (width / 2) * math.cos(rotate) - (height / 2) * math.sin(rotate) + region_x)
-                * _bone['matrix_scale'][1] + _bone['matrix_translation'][0],
-                0,
-                (
-                        (width / 2) * math.sin(rotate) + (height / 2) * math.cos(rotate) + region_y)
-                * _bone['matrix_scale'][2] + _bone['matrix_translation'][2]
-            ), (
-                (
-                        (-width / 2) * math.cos(rotate) - (-height / 2) * math.sin(rotate) + region_x)
-                * _bone['matrix_scale'][1] + _bone['matrix_translation'][0],
-                0,
-                (
-                        (-width / 2) * math.sin(rotate) + (-height / 2) * math.cos(rotate) + region_y)
-                * _bone['matrix_scale'][2] + _bone['matrix_translation'][2]
-            ), (
-                (
-                        (width / 2) * math.cos(rotate) - (-height / 2) * math.sin(rotate) + region_x)
-                * _bone['matrix_scale'][1] + _bone['matrix_translation'][0],
-                0,
-                (
-                        (width / 2) * math.sin(rotate) + (-height / 2) * math.cos(rotate) + region_y)
-                * _bone['matrix_scale'][2] + _bone['matrix_translation'][2]
-            )
+            ((cx * cr - cy * sr + region_x) * sx + tx,
+             0,
+             (cx * sr + cy * cr + region_y) * sz + tz)
+            for cx, cy in corners
         ]
-
-        face_list = [[0, 1, 3, 2]]
-
-        vertices_list =mesh_vertices
+        edge_list = []
+        face_list = [(0, 1, 3, 2)]
         uvs = [0, 0, 1, 0, 0, 1, 1, 1]
-
-        mesh = bpy.data.meshes.new(mesh_name)
-        mesh_obj = bpy.data.objects.new(mesh_name, mesh)
-        mesh.from_pydata(mesh_vertices, [], face_list)
-        mesh.update()
-        scene = bpy.context.scene
-        scene.collection.objects.link(mesh_obj)
-
-
-        for i in range(len(vertices_list)):
-            #if()
-            vertex_group = get_or_create_vertex_group(mesh_obj, bone_name)
-            vertex_group.add([i], 1, 'REPLACE')
-
-        uv_list = create_uv(mesh_name, uvs, atlas)
-        if not uv_list is None:
-            if len(uv_list) == len(vertices_list):
-                uv_layer = mesh.uv_layers.new()
-                for face in mesh.polygons:
-                    for loop_index in face.loop_indices:
-                        vertex_index = mesh.loops[loop_index].vertex_index
-                        uv_layer.data[loop_index].uv = uv_list[vertex_index]
-
-        return mesh_obj
-
-    if point_data.get('type') == 'mesh':
-        has_weight=False
-        #print("====================")
-
-        #print("----------")
+        weight_data = None  # 全部顶点绑到插槽骨骼
+    else:
+        # mesh 附件: 自由网格, 可能带骨骼权重
         vertices = point_data.get('vertices')
-        edges = point_data.get('edges')
+        edges = point_data.get('edges') or []
         triangles = point_data.get('triangles')
         uvs = point_data.get('uvs')
-        #print(vertices)
 
-        edge_list = []
-        for i in range(int(len(edges) / 2)):
-            edge_list.append((int(edges[i * 2] / 2), int(edges[i * 2 + 1] / 2)))
+        edge_list = [(int(edges[i] / 2), int(edges[i + 1] / 2))
+                     for i in range(0, len(edges), 2)]
+        face_list = [tuple(triangles[i:i + 3]) for i in range(0, len(triangles), 3)]
 
-        face_list = []
-        for i in range(int(len(triangles) / 3)):
-            face_list.append((triangles[i * 3], triangles[i * 3 + 1], triangles[i * 3 + 2]))
-
-        mesh_vertices=[]
-        if len(vertices) == len(set(triangles)) * 2:
+        mesh_vertices = []
+        # 无权重时 vertices 只是 (x, y) 平铺, 长度和 uvs 一致; 否则是加权格式
+        if len(vertices) == len(uvs):
+            weight_data = None
             _bone = bone_matrix.get(bone_name)
-            vertices_list = [(vertices[i:i + 2]) for i in range(0, len(vertices), 2)]
-
-            for x, y in vertices_list:
-                x *= scale
-                y *= scale
-                weight = 1
-                pos = [
-                    (x * math.cos(_bone['matrix_eular'][0]) - y * math.sin(_bone['matrix_eular'][0]))
-                    * _bone['matrix_scale'][1] + _bone['matrix_translation'][0] * weight,
-
-                    0,
-
-                    (y * math.cos(_bone['matrix_eular'][0]) + x * math.sin(_bone['matrix_eular'][0]))
-                    * _bone['matrix_scale'][1] + _bone['matrix_translation'][2] * weight,
-                ]
-                mesh_vertices.append(Vector(pos))
+            euler = _bone['matrix_eular'][0]
+            c, s = math.cos(euler), math.sin(euler)
+            sc = _bone['matrix_scale'][1]
+            tx, tz = _bone['matrix_translation'][0], _bone['matrix_translation'][2]
+            for i in range(0, len(vertices), 2):
+                x = vertices[i] * scale
+                y = vertices[i + 1] * scale
+                mesh_vertices.append(((x * c - y * s) * sc + tx,
+                                      0,
+                                      (y * c + x * s) * sc + tz))
         else:
-            has_weight=True
-            vertices_list = get_vertices_list(vertices, scale=scale, _list=[])
-            for data in vertices_list:
-                x = y = 0
+            weight_data = get_vertices_list(vertices, scale=scale)
+            for influences in weight_data:
+                x = y = 0.0
+                for inf in influences:
+                    _bone = bone_matrix.get(bone_list[inf['bone_idx']]["name"])
+                    euler = _bone['matrix_eular'][0]
+                    c, s = math.cos(euler), math.sin(euler)
+                    sc = _bone['matrix_scale'][1]
+                    x += ((inf['x'] * c - inf['y'] * s) * sc
+                          + _bone['matrix_translation'][0]) * inf['weight']
+                    y += ((inf['y'] * c + inf['x'] * s) * sc
+                          + _bone['matrix_translation'][2]) * inf['weight']
+                mesh_vertices.append((x, 0, y))
 
-                for i in data:
-                    bone_index = i.get('bone_idx')
-                    if bone_index:
-                        _bone = bone_matrix.get(bone_list[bone_index].get("name"))
-                        x += (
-                                     (i['x'] * math.cos(_bone['matrix_eular'][0]) - i['y'] * math.sin(
-                                         _bone['matrix_eular'][0]))
-                                     * _bone['matrix_scale'][1] + _bone['matrix_translation'][0]
-                             ) * i['weight']
+    mesh = bpy.data.meshes.new(mesh_name)
+    mesh_obj = bpy.data.objects.new(mesh_name, mesh)
+    mesh.from_pydata(mesh_vertices, edge_list, face_list)
+    mesh.update()
+    bpy.context.scene.collection.objects.link(mesh_obj)
 
-                        y += (
-                                     (i['y'] * math.cos(_bone['matrix_eular'][0]) + i['x'] * math.sin(
-                                         _bone['matrix_eular'][0]))
-                                     * _bone['matrix_scale'][1] + _bone['matrix_translation'][2]
-                             ) * i['weight']
-                    else:
-                        x += i['x']
-                        y += i['y']
+    uv_list = create_uv(region_name, uvs, atlas)
+    if uv_list is not None and len(uv_list) == len(mesh_vertices):
+        assign_uvs(mesh, uv_list)
 
-                pos = [x, 0, y]
-                mesh_vertices.append(Vector(pos))
+    if weight_data is None:
+        vertex_group = get_or_create_vertex_group(mesh_obj, bone_name)
+        vertex_group.add(list(range(len(mesh_vertices))), 1.0, 'REPLACE')
+    else:
+        group_cache = {}
+        for idx, influences in enumerate(weight_data):
+            for inf in influences:
+                b_name = bone_list[inf['bone_idx']]["name"]
+                vgroup = group_cache.get(b_name)
+                if vgroup is None:
+                    vgroup = get_or_create_vertex_group(mesh_obj, b_name)
+                    group_cache[b_name] = vgroup
+                vgroup.add([idx], inf['weight'], 'REPLACE')
 
-
-
-
-        mesh = bpy.data.meshes.new(mesh_name)
-        mesh_obj = bpy.data.objects.new(mesh_name, mesh)
-        mesh.from_pydata(mesh_vertices, edge_list, face_list)
-        mesh.update()
-        scene = bpy.context.scene
-        scene.collection.objects.link(mesh_obj)
-
-        uv_list = create_uv(mesh_name, uvs, atlas)
-
-        if not uv_list is None:
-            if len(uv_list) == len(vertices_list):
-                uv_layer = mesh.uv_layers.new()
-                for face in mesh.polygons:
-                    for loop_index in face.loop_indices:
-                        vertex_index = mesh.loops[loop_index].vertex_index
-                        uv_layer.data[loop_index].uv = uv_list[vertex_index]
+    return mesh_obj
 
 
-        vert_weight = []
-        if has_weight:
-            for i in range(len(vertices_list)):
-                weight_list=vertices_list[i]
-
-                for w in weight_list:
-                    b_name=bone_list[w.get('bone_idx')].get("name")
-                    w_num=w.get('weight')
-                    vertex_group = get_or_create_vertex_group(mesh_obj, b_name)
-                    vertex_group.add([i], w_num, 'REPLACE')
-        else:
-            for i in range(len(vertices_list)):
-                vertex_group = get_or_create_vertex_group(mesh_obj, bone_name)
-                vertex_group.add([i], 1, 'REPLACE')
-
-
-        return mesh_obj
-
-
-    return None
+def _get_pixels(image):
+    """用 foreach_get 批量读像素, 比 image.pixels[:] 快得多"""
+    w, h = image.size
+    buf = np.empty(w * h * 4, dtype=np.float32)
+    image.pixels.foreach_get(buf)
+    return buf.reshape((h, w, 4))
 
 
 def extend_image(image, new_width, new_height):
-    """Extend the image to a new width and height, filling with transparency."""
+    """把图片扩展到指定尺寸, 空白处填透明"""
     old_width, old_height = image.size
-    new_image = bpy.data.images.new(image.name + "_extended", width=new_width, height=new_height, alpha=True)
-
-    # Initialize new image with transparent pixels
+    new_image = bpy.data.images.new(image.name + "_extended",
+                                    width=new_width, height=new_height, alpha=True)
     new_pixels = np.zeros((new_height, new_width, 4), dtype=np.float32)
-
-    # Load the original image pixels and reshape
-    original_pixels = np.array(image.pixels[:]).reshape((old_height, old_width, 4))
-
-    # Copy the original pixels into the new image (top-left aligned)
-    new_pixels[:old_height, :old_width, :] = original_pixels
-
-    # Flatten the array and assign to the new image
-    new_image.pixels = new_pixels.flatten().tolist()
-
+    new_pixels[:old_height, :old_width, :] = _get_pixels(image)
+    new_image.pixels.foreach_set(new_pixels.ravel())
     return new_image
 
-def create_new_image(image1,image2):
-    """Combine two images vertically, preserving transparency."""
-    # Get image sizes
+
+def create_new_image(image1, image2):
+    """把两张图上下拼接, 宽度不同时先补齐"""
     width1, height1 = image1.size
     width2, height2 = image2.size
-
-    # Ensure the widths are the same
-    #if width1 != width2:
-        #raise ValueError("The widths of the images must be the same to combine them vertically.")
-
-    # Determine the maximum width
     max_width = max(width1, width2)
-    # Extend both images to the same width
-    # Extend both images to the same width
+
     if width1 < max_width:
         image1 = extend_image(image1, max_width, height1)
     if width2 < max_width:
         image2 = extend_image(image2, max_width, height2)
 
-    # Create a new image with combined height
     combined_height = height1 + height2
-    combined_image = bpy.data.images.new("CombinedImage", width=max_width, height=combined_height, alpha=True)
+    combined_image = bpy.data.images.new("CombinedImage", width=max_width,
+                                         height=combined_height, alpha=True)
 
-    # Convert image pixel data to numpy arrays
-    image1_pixels = np.array(image1.pixels[:]).reshape((height1, max_width, 4))
-    image2_pixels = np.array(image2.pixels[:]).reshape((height2, max_width, 4))
-
-    # Create a new array for the combined image
     combined_pixels = np.zeros((combined_height, max_width, 4), dtype=np.float32)
-
-    # Copy pixel data into the combined array
-    combined_pixels[:height1, :, :] = image1_pixels
-    combined_pixels[height1:, :, :] = image2_pixels
-
-    # Flatten the array and assign it to the combined image
-    combined_image.pixels = combined_pixels.flatten().tolist()
+    combined_pixels[:height1, :, :] = _get_pixels(image1)
+    combined_pixels[height1:, :, :] = _get_pixels(image2)
+    combined_image.pixels.foreach_set(combined_pixels.ravel())
 
     return combined_image
 
+
 def change_texture_path(obj, new_image_path):
-    if obj.type == 'MESH':
-        for mat in obj.data.materials:
-            if mat.use_nodes:
-                # 遍历材质节点
-                for node in mat.node_tree.nodes:
-                    # 查找图像纹理节点
-                    if node.type == 'TEX_IMAGE':
-                        # 更改图像路径
-                        node.image.filepath = new_image_path
-                        #print(f"Texture path for {obj.name} changed to {new_image_path}")
+    if obj.type != 'MESH':
+        return
+    for mat in obj.data.materials:
+        if mat and mat.use_nodes:
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    node.image.filepath = new_image_path
 
 
-def create_mesh_all(json_data, atlas, rig, image_path, bone_matrix, scale,add):
-    final_image=image_path
+def get_skin_attachments(json_data):
+    """取默认皮肤的附件表, 兼容 3.8+ 的列表格式和更早的字典格式"""
+    skins = json_data.get("skins")
+    if isinstance(skins, dict):
+        return skins.get("default") or next(iter(skins.values()))
+    return skins[0].get("attachments")
+
+
+def create_mesh_all(json_data, atlas, rig, image_path, bone_matrix, scale, add):
+    final_image = image_path
     max_meshindex = 0
-    image1=""
-    image2 =""
+    image1 = None
+    image2 = None
+
     if add:
-
+        # 找到已有网格的最大序号和旧贴图路径, 把新旧贴图拼成一张
         oldimg_path = ""
-
         for obj in bpy.data.objects:
-            if obj.type == 'MESH':
-                meshindex = obj.data.get("meshindex")
-                if meshindex and meshindex > max_meshindex:
-                    max_meshindex = meshindex
-                    # 遍历对象的所有材质
-                    for mat in obj.data.materials:
-                        # 确保材质使用节点
-                        if mat.use_nodes:
-                            for node in mat.node_tree.nodes:
-                                # 找到纹理图像节点
-                                if node.type == 'TEX_IMAGE':
-                                    image = node.image
-                                    if image:
-                                        oldimg_path = image.filepath
-        max_meshindex+=1
+            if obj.type != 'MESH':
+                continue
+            meshindex = obj.data.get("meshindex")
+            if meshindex and meshindex > max_meshindex:
+                max_meshindex = meshindex
+                for mat in obj.data.materials:
+                    if mat and mat.use_nodes:
+                        for node in mat.node_tree.nodes:
+                            if node.type == 'TEX_IMAGE' and node.image:
+                                oldimg_path = node.image.filepath
+
         if oldimg_path != "":
+            final_image = os.path.splitext(image_path)[0] + "_all.png"
 
-            image1_path = oldimg_path
-            image2_path = image_path
-            final_image = image_path.split(".")[0] + "_all" + ".png"
-
-            # Load images
-            image1 = bpy.data.images.load(image1_path)
-            image2 = bpy.data.images.load(image2_path)
-            width1, height1 = image1.size
-            width2, height2 = image2.size
-            # Combine images
+            image1 = bpy.data.images.load(oldimg_path)
+            image2 = bpy.data.images.load(image_path)
             combined_image = create_new_image(image1, image2)
             combined_image.filepath_raw = final_image
             combined_image.file_format = 'PNG'
             combined_image.save()
 
-
-
-            h_scale = height1 / (height1 + height2)
-
+            width1, height1 = image1.size
+            width2, height2 = image2.size
+            # 旧网格 uv 压缩到拼接图的下半部分
+            old_h_scale = height1 / (height1 + height2)
+            old_w_scale = width1 / width2 if width1 < width2 else 1.0
             for obj in bpy.data.objects:
-                if obj.type == 'MESH':
-                    meshindex = obj.data.get("meshindex")
-                    if meshindex:
-                        change_texture_path(obj,final_image)
-                        uv_layer = obj.data.uv_layers.active
-                        # 调整UV坐标
-                        for poly in obj.data.polygons:
-                            for loop_index in poly.loop_indices:
-                                uv = uv_layer.data[loop_index].uv
-                                # 缩放UV的Y坐标
-                                if width1 < width2:
-                                    uv.x *= width1 / width2
-                                uv.y *= h_scale
+                if obj.type == 'MESH' and obj.data.get("meshindex"):
+                    change_texture_path(obj, final_image)
+                    uv_layer = obj.data.uv_layers.active
+                    if uv_layer is None:
+                        continue
+                    for uv_data in uv_layer.data:
+                        uv_data.uv.x *= old_w_scale
+                        uv_data.uv.y *= old_h_scale
 
-
-
-    bones_info = json_data.get("bones")
-    # 读取所有插槽,不在插槽内的需要隐藏
     slots = json_data.get("slots")
     bone_list = json_data.get("bones")
-    bone_info={}
+    bone_info = {}
     attachment_list = {}
     bone_z = {}
     mesh_index = {}
-    z_add = 0-(0.05*(max_meshindex+1))
-    mesh_index_add = max_meshindex
+
+    # 序号从已有最大值往后排, 避免和旧网格重叠; z 按插槽顺序错开做前后排序
+    mesh_index_add = max_meshindex + 1
+    z_add = -0.05 * mesh_index_add
     for slot in slots:
+        slot_name = slot.get('name')
         z_add -= 0.05
-        bone = slot.get('bone')
-        attachment = slot.get('attachment')
-        bone_info[slot.get('name')] = bone
-        bone_z[slot.get('name')] = z_add
-        mesh_index[slot.get('name')] = mesh_index_add
+        bone_info[slot_name] = slot.get('bone')
+        bone_z[slot_name] = z_add
+        mesh_index[slot_name] = mesh_index_add
         mesh_index_add += 1
 
-        if attachment:
-            attachment_list[slot.get('name')] = attachment
-    mesh_date = json_data.get("skins")[0].get("attachments")
-    # 遍历所有skin,并隐藏不在附件中的网格
+        if slot.get('attachment'):
+            attachment_list[slot_name] = slot.get('attachment')
 
-    material = create_materials(f'PDXmat_All', final_image)
-    for key, value in mesh_date.items():
-        bone_name=bone_info.get(key)
+    # 新网格 uv 需要整体映射到拼接图的上半部分
+    new_uv_transform = None
+    if add and image1 is not None:
+        width1, height1 = image1.size
+        width2, height2 = image2.size
+        new_uv_transform = (
+            width2 / width1 if width2 < width1 else 1.0,  # x 缩放
+            height2 / (height1 + height2),                # y 缩放
+            height1 / (height1 + height2),                # y 偏移
+        )
+
+    mesh_data = get_skin_attachments(json_data)
+    material = create_materials('PDXmat_All', final_image)
+
+    for key, value in mesh_data.items():
+        bone_name = bone_info.get(key)
+        attachment = attachment_list.get(key)
         for mesh_name, point_data in value.items():
-            attachment = attachment_list.get(key)
-            obj = create_mesh(mesh_name, bone_name, point_data, bone_list, atlas, bone_matrix, scale)
-            if not attachment:
+            obj = create_mesh(mesh_name, bone_name, point_data, bone_list,
+                              atlas, bone_matrix, scale)
+            if obj is None:
+                continue
+
+            # 只显示插槽当前激活的附件
+            if attachment != mesh_name:
                 obj.hide_viewport = True
                 obj.hide_render = True
+
+            obj.location.y += bone_z[key]
+            obj.data["meshindex"] = mesh_index[key]
+
+            modifier = obj.modifiers.new(name="Armature", type='ARMATURE')
+            modifier.object = rig
+            modifier.use_vertex_groups = True
+
+            if new_uv_transform is not None:
+                w_scale, h_scale, h_offset = new_uv_transform
+                uv_layer = obj.data.uv_layers.active
+                if uv_layer is not None:
+                    for uv_data in uv_layer.data:
+                        uv_data.uv.x *= w_scale
+                        uv_data.uv.y = uv_data.uv.y * h_scale + h_offset
+
+            if obj.data.materials:
+                obj.data.materials[0] = material
             else:
-                if attachment != mesh_name:
-                    obj.hide_viewport = True
-                    obj.hide_render = True
-            if obj:
-                obj.location.y += bone_z[key]
-                obj.data["meshindex"] = mesh_index[key]
-                #material = create_materials(f'PDXmat_{mesh_name}', final_image)
+                obj.data.materials.append(material)
 
-                modifier = obj.modifiers.new(name="Armature", type='ARMATURE')
-                modifier.object = rig
-                modifier.use_vertex_groups = True
-
-                if add:
-                    width1, height1=image1.size
-                    width2, height2=image2.size
-                    uv_layer = obj.data.uv_layers.active
-                    h_scale=height2/(height2+height1)
-                    h_scale_add=height1/(height2+height1)
-                    # 调整UV坐标
-                    for poly in obj.data.polygons:
-                        for loop_index in poly.loop_indices:
-                            uv = uv_layer.data[loop_index].uv
-                            # 缩放UV的Y坐标
-                            if width2 < width1:
-                                w_scale=width2/width1
-                                uv.x *= w_scale
-                            uv.y *= h_scale
-                            uv.y +=h_scale_add
-
-
-                bpy.context.view_layer.update()
-                # 检查对象是否已经有材质槽
-                if obj.data.materials:
-                    # 将新创建的材质赋予第一个材质槽
-                    obj.data.materials[0] = material
-                else:
-                    # 如果没有材质槽，则追加材质
-                    obj.data.materials.append(material)
-
-
-def set_constant_interpolation_current_frame():
-    # 获取当前帧
-    current_frame = bpy.context.scene.frame_current
-
-    # 获取所有对象
-    for obj in bpy.context.scene.objects:
-        # 确保对象有动画数据
-        if obj.animation_data and obj.animation_data.action:
-            action = obj.animation_data.action
-
-            # 遍历动作中的所有动画曲线
-            for fcurve in action.fcurves:
-                # 查找当前帧的关键帧点
-                for keyframe in fcurve.keyframe_points:
-                    if keyframe.co[0] == current_frame:
-                        keyframe.interpolation = 'CONSTANT'
 
 def create_animations(animations_data, rig, scale):
-    animations = animations_data.get("normal")
+    """直接写 F 曲线生成动画, 不经过 bpy.ops, 速度快且不依赖选择状态
+
+    坐标换算约定(与骨骼创建逻辑一致):
+    - spine 的旋转角 == pose 骨骼 rotation_euler[0]
+    - spine 的位移在父骨骼空间中, 用静置矩阵换算到骨骼本地空间
+    """
+    if not animations_data:
+        return
+
+    animation = animations_data.get("normal")
+    if not animation:
+        animation = next((v for v in animations_data.values() if "bones" in v), None)
+    if not animation:
+        return
+
+    bone_anim = animation.get("bones", {})
     frame_end = 0
-    if animations:
-        bone_anim = animations.get("bones")
-        event = animations.get("events")
-        if event:
-            for e in event:
-                name = e.get("name")
-                if name == "finish":
-                    frame_end = int(e.get("time") * 30)
-    else:
-        for key,value in animations_data.items():
-            if "bones" in value:
-                bone_anim = value.get("bones")
-                break
+    for e in animation.get("events") or []:
+        if e.get("name") == "finish":
+            frame_end = int(e.get("time", 0) * FPS)
+
+    anim_data = rig.animation_data_create()
+    action = bpy.data.actions.new(name=f"{rig.name}_action")
+    anim_data.action = action
+
+    for bone_name, timelines in bone_anim.items():
+        pbone = rig.pose.bones.get(bone_name)
+        if pbone is None:
+            print(f"[spine2d] 动画引用了不存在的骨骼: {bone_name}")
+            continue
+        base_path = f'pose.bones["{bone_name}"].'
+
+        rotate_keys = timelines.get("rotate")
+        if rotate_keys:
+            fcurve = action.fcurves.new(base_path + "rotation_euler",
+                                        index=0, action_group=bone_name)
+            fcurve.keyframe_points.add(len(rotate_keys))
+            prev_angle = None
+            for kp, key in zip(fcurve.keyframe_points, rotate_keys):
+                frame = int(key.get("time", 0) * FPS)
+                frame_end = max(frame_end, frame)
+                angle = math.radians(key.get("angle", 0))
+                # 展开角度使相邻关键帧走最短路径, 和 spine 的插值一致
+                if prev_angle is not None:
+                    while angle - prev_angle > math.pi:
+                        angle -= 2 * math.pi
+                    while angle - prev_angle < -math.pi:
+                        angle += 2 * math.pi
+                prev_angle = angle
+                kp.co = (frame, angle)
+                kp.interpolation = 'CONSTANT' if key.get("curve") == "stepped" else 'LINEAR'
+            fcurve.update()
+
+        translate_keys = timelines.get("translate")
+        if translate_keys:
+            fcurves = [action.fcurves.new(base_path + "location",
+                                          index=i, action_group=bone_name)
+                       for i in range(3)]
+            for fc in fcurves:
+                fc.keyframe_points.add(len(translate_keys))
+
+            # spine 位移在父骨骼空间: 先转到骨架空间, 再转到自身静置空间
+            rest_inv = pbone.bone.matrix_local.to_3x3().inverted()
+            parent_rot = (pbone.parent.bone.matrix_local.to_3x3()
+                          if pbone.parent else None)
+
+            for i, key in enumerate(translate_keys):
+                frame = int(key.get("time", 0) * FPS)
+                frame_end = max(frame_end, frame)
+                dx = key.get("x", 0) * scale
+                dy = key.get("y", 0) * scale
+                if parent_rot is not None:
+                    loc = rest_inv @ (parent_rot @ Vector((0.0, dx, dy)))
+                else:
+                    loc = rest_inv @ Vector((dx, 0.0, dy))
+                interp = 'CONSTANT' if key.get("curve") == "stepped" else 'LINEAR'
+                for axis in range(3):
+                    kp = fcurves[axis].keyframe_points[i]
+                    kp.co = (frame, loc[axis])
+                    kp.interpolation = interp
+            for fc in fcurves:
+                fc.update()
+
+    bpy.context.scene.frame_end = max(frame_end, 1)
 
 
-
-
-
-
-
-    bpy.ops.object.select_all(action='DESELECT')
-    bpy.context.view_layer.objects.active = rig
-    bpy.ops.object.mode_set(mode='POSE')
-
-    #bpy.context.scene.frame_end = frame_end
-
-    for bone_key, value in bone_anim.items():
-        bone_name = bone_key
-        rotate = value.get("rotate")
-        translate = value.get("translate")
-
-
-        if rotate:
-            rot = 0
-            for key in rotate:
-                frame = int(key.get("time", 0) * 30)
-                if frame>frame_end:
-                    frame_end=frame
-
-                bpy.context.scene.frame_set(frame)
-                bpy.ops.pose.select_all(action='DESELECT')
-                bpy.ops.object.select_pattern(pattern=bone_name)
-                key_r = key.get("angle", 0) + rot
-
-                curve = key.get("curve","")
-
-                if curve=="stepped":
-                    set_constant_interpolation_current_frame()
-
-                rot -= key_r
-
-                angle_radians = math.radians(key_r)
-                #bpy.ops.transform.rotate(value=angle_radians,orient_axis='Y')
-                bpy.ops.transform.rotate(value=angle_radians, orient_axis='Y', orient_type='GLOBAL')
-                bpy.ops.anim.keyframe_insert_by_name(type="Rotation")
-
-        if translate:
-            loc = 0
-            loc_x = 0
-            for key in translate:
-                frame = int(key.get("time", 0) * 30)
-                bpy.context.scene.frame_set(frame)
-                bpy.ops.pose.select_all(action='DESELECT')
-                bpy.ops.object.select_pattern(pattern=bone_name)
-
-                key_y = key.get("y", 0) * scale + loc
-                loc -= key_y
-                key_x = key.get("x", 0) * scale + loc_x
-                loc_x -= key_x
-                bpy.ops.transform.translate(
-                    value=(key_x, 0, key_y),
-                    orient_type='GLOBAL',
-                    constraint_axis=(False, True, False)
-                )
-                #bpy.ops.transform.translate(value=(key_x, 0, key_y), orient_axis_ortho='Z')
-                bpy.ops.anim.keyframe_insert_by_name(type="Location")
-    bpy.context.scene.frame_end = frame_end
-    # 遍历对象的所有动作
-    for action in bpy.data.actions:
-        # 遍历每个动作中的所有F曲线
-        for fcurve in action.fcurves:
-            # 遍历F曲线中的所有关键帧点
-            for keyframe_point in fcurve.keyframe_points:
-                keyframe_point.interpolation = 'LINEAR'
-
-def bing_ik(rig,ik_info):
+def bind_ik(rig, ik_info):
     for ik_data in ik_info:
-        # 1. 获取末端骨骼（IK 应该加在链的最后一节骨骼上）
-        end_bone_name = ik_data["bones"][-1]
-        end_bone = rig.pose.bones.get(end_bone_name)
+        # IK 约束加在链末端骨骼上
+        end_bone = rig.pose.bones.get(ik_data["bones"][-1])
+        if end_bone is None:
+            print(f"[spine2d] IK 引用了不存在的骨骼: {ik_data['bones'][-1]}")
+            continue
 
-        # 2. 获取目标骨骼（target）
-        target_bone_name = ik_data["target"]
-
-        # 3. 创建 IK 约束
         constraint = end_bone.constraints.new(type='IK')
         constraint.name = f"IK_{ik_data['name']}"
-        constraint.target = rig           # 目标为自身骨架
-        constraint.subtarget = target_bone_name
-        constraint.chain_count = len(ik_data["bones"])  # 链长为骨骼数量
+        constraint.target = rig
+        constraint.subtarget = ik_data["target"]
+        constraint.chain_count = len(ik_data["bones"])
 
         if ik_data.get("bendPositive"):
-            # 4. 控制弯曲方向（根据 bendPositive 决定 pole_angle 方向）
-            constraint.pole_angle = 0 if ik_data["bendPositive"]!="false" else math.pi  # 反向弯曲可调 π 弧度
+            # 根据 bendPositive 控制弯曲方向
+            constraint.pole_angle = 0 if ik_data["bendPositive"] != "false" else math.pi
 
 
+def reload_uvs(json_data, atlas, image_path):
+    """重载模式: 只按图集重建已有网格的 uv 并刷新贴图路径"""
+    mesh_data = get_skin_attachments(json_data)
+    mesh_uv = {}
+    for value in mesh_data.values():
+        for mesh_name, point_data in value.items():
+            if point_data.get('type') == 'mesh':
+                uvs = point_data.get('uvs')
+            else:
+                uvs = [0, 0, 1, 0, 0, 1, 1, 1]
+            region_name = point_data.get('path') or point_data.get('name') or mesh_name
+            uv_list = create_uv(region_name, uvs, atlas)
+            if uv_list is not None:
+                mesh_uv[mesh_name] = uv_list
 
-def import_jsonfile(json_path,add=False,reload=False):
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        mesh = obj.data
+        uv_list = mesh_uv.get(obj.name)
+        if uv_list and len(uv_list) == len(mesh.vertices):
+            if mesh.uv_layers.active:
+                mesh.uv_layers.remove(mesh.uv_layers.active)
+            assign_uvs(mesh, uv_list)
+        change_texture_path(obj, image_path)
+
+
+def import_jsonfile(json_path, add=False, reload=False):
     scale = 0.01
 
-    name = os.path.basename(json_path)
     folder_path = os.path.dirname(json_path)
-    atlas_path = folder_path + "/" + name.split(".")[0] + ".atlas"
-    # 把图集转化json可读
-    atlas = read_atlas(atlas_path)
-    # 图片路径
-    image_path = folder_path + "/" + atlas.get("image")
-    #image_path = image_path.split(".")[0] + ".png"
-    # 动画
+    base_name = os.path.splitext(os.path.basename(json_path))[0]
+    atlas_path = os.path.join(folder_path, base_name + ".atlas")
+    if not os.path.exists(atlas_path):
+        raise FileNotFoundError(f"找不到同名图集文件: {atlas_path}")
 
-    # 解析spine数据
+    atlas = read_atlas(atlas_path)
+    image_path = os.path.join(folder_path, atlas.get("image", ""))
+
     with open(json_path, 'r', encoding='utf-8') as file:
         content = file.read()
-
-
-    processed_content = convert_to_latin1_compatible(content)
-    json_data = json.loads(processed_content)
+    json_data = json.loads(convert_to_latin1_compatible(content))
 
     if reload:
+        reload_uvs(json_data, atlas, image_path)
+        return
 
+    # 创建骨骼
+    bones_info = json_data.get("bones")
+    rig_name = base_name + "_rig"
+    new_rig = create_bones(rig_name, bones_info, scale)
 
-        mesh_date = json_data.get("skins")[0].get("attachments")
-        mesh_uv={}
-        for key, value in mesh_date.items():
-            #bone_name = bone_info.get(key)
-            for mesh_name, point_data in value.items():
-                if point_data.get('type') == 'mesh':
-                    uvs = point_data.get('uvs')
-                    uv_list = create_uv(mesh_name, uvs, atlas)
-                else:
-                    uvs = [0, 0, 1, 0, 0, 1, 1, 1]
-                    uv_list = create_uv(mesh_name, uvs, atlas)
-                if not uv_list is None:
-                    mesh_uv[mesh_name]=uv_list
-        for obj in bpy.data.objects:
-            mesh = obj.data
-            if obj.type == 'MESH':
-                if obj.name in mesh_uv:
-                    vertices = [v.co for v in mesh.vertices]
-                    uv_list=mesh_uv[obj.name]
+    ik_info = json_data.get("ik")
+    if ik_info:
+        bind_ik(new_rig, ik_info)
 
-                    if len(uv_list) == len(vertices):
-                        if mesh.uv_layers.active:
-                            uv_layer = mesh.uv_layers.active
-                            mesh.uv_layers.remove(uv_layer)
+    bone_matrix = _get_bone_matrix_dict(new_rig)
 
-                            uv_layer = mesh.uv_layers.new()
-                            for face in mesh.polygons:
-                                for loop_index in face.loop_indices:
-                                    vertex_index = mesh.loops[loop_index].vertex_index
-                                    uv_layer.data[loop_index].uv = uv_list[vertex_index]
-                change_texture_path(obj,image_path)
+    # 创建网格
+    create_mesh_all(json_data, atlas, new_rig, image_path, bone_matrix, scale, add)
 
-
-
-
-    else:
-        # 创建材质
-        # image_path
-        # materials=creat_materials(atlas["image"].split(".")[0]+"_mat",image_path)
-        # 创建骨骼
-        bones_info = json_data.get("bones")
-        ik_info = json_data.get("ik")
-        
-        rig_name = name.split(".")[0] + "_rig"
-        new_rig = create_bones(rig_name, bones_info, scale)
-        if ik_info:
-            bing_ik(new_rig,ik_info)
-        bone_matrix = _get_bone_matrix_dict(new_rig)
-
-        create_mesh_all(json_data, atlas, new_rig, image_path, bone_matrix, scale, add)
-        
-        animations = json_data.get("animations")
-
-        if not add:
-            create_animations(animations, new_rig, scale)
-        
-
-
-
-    ''''''
+    # 创建动画(追加模式沿用场景里已有的动画)
+    if not add:
+        create_animations(json_data.get("animations"), new_rig, scale)
